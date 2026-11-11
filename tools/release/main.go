@@ -64,7 +64,7 @@ type tarEntry struct {
 func main() {
 	c := config{}
 	var targets string
-	flag.StringVar(&c.Version, "version", "1.0", "release version without a leading v")
+	flag.StringVar(&c.Version, "version", "1.1", "release version without a leading v")
 	flag.StringVar(&c.OutDir, "out", "dist", "output directory")
 	flag.StringVar(&c.Maintainer, "maintainer", envOr("BNT_MAINTAINER", defaultMaintainer), "maintainer as \"Name <email>\" (or set BNT_MAINTAINER)")
 	flag.StringVar(&c.URL, "repo", defaultRepo, "project URL used in package metadata and the PKGBUILD source")
