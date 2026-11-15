@@ -26,16 +26,19 @@ import (
 )
 
 const (
-	StreamTypeHTTP = 0x01
-	StreamTypeUDP  = 0x02
-	StreamTypeTCP  = 0x03
-	tokenSaveFile  = "bedrocknode-token.txt"
-	nodeSaveFile   = "bedrocknode-node.txt"
-	maxTokenLength = 4096
-	handshakeHint  = 5
+	StreamTypeHTTP       = 0x01
+	StreamTypeUDP        = 0x02
+	StreamTypeTCP        = 0x03
+	StreamTypeTCPMapped  = 0x04 // [0x04][2B localTCPPort] for multi-server tunnels
+	RawUDPMagicHeartbeat = 0x01 // [0x01][token bytes] -> Server replies [0x01, 0x01]
+	RawUDPMagicData      = 0x02 // [0x02][2B publicUDPPort][4B playerIPv4][2B playerPort][payload]
+	tokenSaveFile        = "bedrocknode-token.txt"
+	nodeSaveFile         = "bedrocknode-node.txt"
+	maxTokenLength       = 4096
+	handshakeHint        = 5
 )
 
-var version = "dev"
+var version = "v1.2.0"
 
 var errInvalidToken = errors.New("invalid auth token rejected by server")
 
@@ -49,9 +52,21 @@ type RegionNode struct {
 var defaultRegionNodes = []RegionNode{
 	{
 		Code:        "US",
-		Name:        "North America (US Hub)",
+		Name:        "North America (US East Hub)",
 		WebURL:      "https://bedrocknode.net",
 		ControlAddr: "51.222.142.179:7000",
+	},
+	{
+		Code:        "TX",
+		Name:        "North America (US Texas Hub)",
+		WebURL:      "https://texas.bedrocknode.net",
+		ControlAddr: "216.128.129.60:7000",
+	},
+	{
+		Code:        "UK",
+		Name:        "Europe (London UK Hub)",
+		WebURL:      "https://uk.bedrocknode.net",
+		ControlAddr: "104.238.173.37:7000",
 	},
 	{
 		Code:        "BR",
@@ -67,6 +82,31 @@ var defaultRegionNodes = []RegionNode{
 	},
 }
 
+type rawPlayerKey struct {
+	pubPort    uint16
+	playerIP   [4]byte
+	playerPort uint16
+}
+
+type candConn struct {
+	label string
+	conn  *net.UDPConn
+}
+
+type rawLocalSession struct {
+	conns      []candConn
+	winnerIdx  atomic.Int32
+	lastActive atomic.Int64
+}
+
+func (s *rawLocalSession) Close() {
+	for _, c := range s.conns {
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
+	}
+}
+
 func main() {
 	var (
 		nodeFlag        string
@@ -80,7 +120,7 @@ func main() {
 		showVersion     bool
 	)
 
-	flag.StringVar(&nodeFlag, "node", "", "Region code (US, BR, ASIA) or custom VPS domain/IP (e.g. asia.bedrocknode.net)")
+	flag.StringVar(&nodeFlag, "node", "", "Region code (US, TX, UK, BR, ASIA) or custom VPS domain/IP")
 	flag.StringVar(&controlAddr, "control", "", "Bedrock Node Tunnel VPS control address (auto-detected across regions if empty)")
 	flag.StringVar(&webUrl, "web", "https://bedrocknode.net", "Bedrock Node Tunnel Web Dashboard URL")
 	flag.StringVar(&token, "token", "", "Tunnel token (leave empty for automatic browser claim)")
@@ -149,7 +189,7 @@ func main() {
 		localUDPIP = detectOutboundLANIP()
 	}
 
-	log.Printf("[Bedrock Node Tunnel] Universal Open-Source Client %s Starting...", version)
+	log.Printf("[Bedrock Node Tunnel] Universal Open-Source Client %s (Raw UDP Fast-Lane) Starting...", version)
 	log.Printf("[Bedrock Node Tunnel] Local TCP target: %s | Local UDP target IP: %s", localSignaling, localUDPIP)
 	runClient(controlAddr, pollWebOverride, token, localSignaling, localUDPIP, localUDPDefault)
 }
@@ -157,6 +197,20 @@ func main() {
 func resolveNodeInput(input string) RegionNode {
 	clean := strings.TrimSpace(input)
 	upper := strings.ToUpper(clean)
+
+	// Support friendly regional aliases
+	switch upper {
+	case "DALLAS", "TEXAS", "US-CENTRAL", "US-SOUTH":
+		upper = "TX"
+	case "LONDON", "EU", "EUROPE", "GB":
+		upper = "UK"
+	case "BRAZIL", "SA", "SOUTHA":
+		upper = "BR"
+	case "SG", "SINGAPORE", "AP":
+		upper = "ASIA"
+	case "USEAST", "US-EAST":
+		upper = "US"
+	}
 
 	for _, n := range defaultRegionNodes {
 		hostOnly := strings.TrimPrefix(strings.TrimPrefix(n.WebURL, "https://"), "http://")
@@ -207,7 +261,6 @@ func resolveNodeInput(input string) RegionNode {
 }
 
 func getActiveNodeList(customControl, customWeb string) []RegionNode {
-	// If the user explicitly passed a region via -node, -control, or -web, use that specific node
 	if customControl != "" || customWeb != "" {
 		cAddr := customControl
 		wURL := customWeb
@@ -237,7 +290,6 @@ func getActiveNodeList(customControl, customWeb string) []RegionNode {
 		nodes = append(nodes, n)
 	}
 
-	// Optional live discovery for future nodes if /api/nodes is added later
 	client := &http.Client{Timeout: 2 * time.Second}
 	if resp, err := client.Get("https://bedrocknode.net/api/nodes"); err == nil {
 		if resp.StatusCode == http.StatusOK {
@@ -410,12 +462,62 @@ func detectOutboundLANIP() string {
 	return "127.0.0.1"
 }
 
+func tuneTCPConn(conn net.Conn) {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(15 * time.Second)
+		_ = tcpConn.SetReadBuffer(4 * 1024 * 1024)
+		_ = tcpConn.SetWriteBuffer(4 * 1024 * 1024)
+	}
+}
+
+func tuneUDPConn(conn *net.UDPConn, bufBytes int) {
+	if conn != nil {
+		_ = conn.SetReadBuffer(bufBytes)
+		_ = conn.SetWriteBuffer(bufBytes)
+	}
+}
+
 func newYamuxConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.EnableKeepAlive = true
-	cfg.KeepAliveInterval = 15 * time.Second
-	cfg.ConnectionWriteTimeout = 15 * time.Second
+	cfg.KeepAliveInterval = 20 * time.Second
+	cfg.ConnectionWriteTimeout = 35 * time.Second
+	cfg.MaxStreamWindowSize = 4 * 1024 * 1024
 	return cfg
+}
+
+func buildLocalUDPCandidates(localUDPIP string, targetPort int) []candConn {
+	type targetSpec struct {
+		netw string
+		addr string
+	}
+	specs := []targetSpec{
+		{"udp4", net.JoinHostPort(localUDPIP, fmt.Sprintf("%d", targetPort))},
+		{"udp4", net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", targetPort))},
+		{"udp6", net.JoinHostPort("::1", fmt.Sprintf("%d", targetPort))},
+	}
+
+	var conns []candConn
+	seen := make(map[string]bool)
+	for _, s := range specs {
+		if seen[s.addr] {
+			continue
+		}
+		seen[s.addr] = true
+		rAddr, err := net.ResolveUDPAddr(s.netw, s.addr)
+		if err != nil {
+			continue
+		}
+		c, err := net.DialUDP(s.netw, nil, rAddr)
+		if err != nil {
+			continue
+		}
+		tuneUDPConn(c, 4*1024*1024)
+		conns = append(conns, candConn{label: s.addr, conn: c})
+	}
+	return conns
 }
 
 func randomHex(nBytes int) string {
@@ -473,13 +575,13 @@ func obtainOrClaimToken(customControl, customWeb, flagToken string) (string, str
 	claimCode := strings.ToUpper(randomHex(3))
 
 	fmt.Println("==========================================================================")
-	fmt.Println("  BEDROCK NODE TUNNEL â€” FIRST TIME SETUP (MULTI-REGION)")
+	fmt.Println("  BEDROCK NODE TUNNEL — FIRST TIME SETUP (MULTI-REGION)")
 	fmt.Println("==========================================================================")
 	fmt.Printf("  Claim Code: %s\n\n", claimCode)
 	fmt.Println("  Open your closest regional dashboard to claim this tunnel:")
 	for _, n := range nodes {
 		if n.WebURL != "" {
-			fmt.Printf("  â€¢ %-30s %s/?claim=%s\n", n.Name+":", strings.TrimRight(n.WebURL, "/"), url.QueryEscape(claimCode))
+			fmt.Printf("  * %-32s %s/?claim=%s\n", n.Name+":", strings.TrimRight(n.WebURL, "/"), url.QueryEscape(claimCode))
 		}
 	}
 	fmt.Println("==========================================================================")
@@ -584,6 +686,7 @@ func runClient(customControl, customWeb, flagToken, localSignaling, localUDPIP s
 				time.Sleep(3 * time.Second)
 				continue
 			}
+			tuneTCPConn(conn)
 
 			if err := sendTunnelToken(conn, token); err != nil {
 				conn.Close()
@@ -596,7 +699,7 @@ func runClient(customControl, customWeb, flagToken, localSignaling, localUDPIP s
 						time.Sleep(3 * time.Second)
 						continue
 					}
-					log.Printf("[Tunnel Client] Token not found on %s â€” checking other regional hubs...", targetControl)
+					log.Printf("[Tunnel Client] Token not found on %s — checking other regional hubs...", targetControl)
 					targetControl = ""
 				} else {
 					handshakeFailures++
@@ -626,6 +729,7 @@ func runClient(customControl, customWeb, flagToken, localSignaling, localUDPIP s
 				if err != nil {
 					continue
 				}
+				tuneTCPConn(conn)
 				reachable++
 
 				err = sendTunnelToken(conn, token)
@@ -670,14 +774,186 @@ func runClient(customControl, customWeb, flagToken, localSignaling, localUDPIP s
 
 		log.Printf("[Tunnel Client] Authenticated tunnel established via %s! TCP -> %s | UDP -> %s", activeControl, localSignaling, localUDPIP)
 
+		stopRawUDP := make(chan struct{})
+		go runRawUDPFastLane(stopRawUDP, activeControl, token, localUDPIP, localUDPDefault)
+
 		for {
 			stream, err := sess.Accept()
 			if err != nil {
 				log.Printf("[Tunnel Client] Tunnel disconnected (%v). Reconnecting...", err)
-				_ = sess.Close()
 				break
 			}
 			go handleIncomingStream(stream, localSignaling, localUDPIP, localUDPDefault)
+		}
+
+		close(stopRawUDP)
+		_ = sess.Close()
+	}
+}
+
+func runRawUDPFastLane(stopCh <-chan struct{}, controlAddr, token, localUDPIP string, localUDPDefault int) {
+	rAddr, err := net.ResolveUDPAddr("udp4", controlAddr)
+	if err != nil {
+		return
+	}
+	rawConn, err := net.DialUDP("udp4", nil, rAddr)
+	if err != nil {
+		return
+	}
+	tuneUDPConn(rawConn, 8*1024*1024)
+
+	var (
+		sessionsMu sync.Mutex
+		sessions   = make(map[rawPlayerKey]*rawLocalSession)
+		activeFlag atomic.Bool
+	)
+
+	defer func() {
+		_ = rawConn.Close()
+		sessionsMu.Lock()
+		for k, s := range sessions {
+			s.Close()
+			delete(sessions, k)
+		}
+		sessionsMu.Unlock()
+	}()
+
+	go func() {
+		<-stopCh
+		_ = rawConn.Close()
+	}()
+
+	// Send immediate registration heartbeat + repeat every 8 seconds to keep NAT hole & server fast-lane open
+	hbPkt := append([]byte{RawUDPMagicHeartbeat}, []byte(token)...)
+	_, _ = rawConn.Write(hbPkt)
+
+	go func() {
+		ticker := time.NewTicker(8 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				_, _ = rawConn.Write(hbPkt)
+			}
+		}
+	}()
+
+	// Clean up idle player UDP sessions every 30s
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				now := time.Now().UnixNano()
+				sessionsMu.Lock()
+				for k, s := range sessions {
+					if now-s.lastActive.Load() > int64(2*time.Minute) {
+						s.Close()
+						delete(sessions, k)
+					}
+				}
+				sessionsMu.Unlock()
+			}
+		}
+	}()
+
+	buf := make([]byte, 65535)
+	for {
+		n, err := rawConn.Read(buf)
+		if err != nil {
+			select {
+			case <-stopCh:
+				return
+			default:
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+		}
+		if n < 2 {
+			continue
+		}
+
+		switch buf[0] {
+		case RawUDPMagicHeartbeat:
+			if n >= 2 && buf[1] == 0x01 && !activeFlag.Swap(true) {
+				log.Printf("[Tunnel Client] 🚀 RAW UDP FAST-LANE ACTIVE on %s (UDP traffic bypassed yamux!)", controlAddr)
+			}
+
+		case RawUDPMagicData:
+			if n <= 9 {
+				continue
+			}
+			pubPort := binary.BigEndian.Uint16(buf[1:3])
+			var key rawPlayerKey
+			key.pubPort = pubPort
+			copy(key.playerIP[:], buf[3:7])
+			key.playerPort = binary.BigEndian.Uint16(buf[7:9])
+			payload := buf[9:n]
+
+			targetPort := int(pubPort)
+			if targetPort == 0 {
+				targetPort = localUDPDefault
+			}
+
+			nowNano := time.Now().UnixNano()
+			sessionsMu.Lock()
+			sess, exists := sessions[key]
+			if !exists {
+				conns := buildLocalUDPCandidates(localUDPIP, targetPort)
+				if len(conns) == 0 {
+					sessionsMu.Unlock()
+					continue
+				}
+				sess = &rawLocalSession{conns: conns}
+				sess.winnerIdx.Store(-1)
+				sess.lastActive.Store(nowNano)
+				sessions[key] = sess
+
+				for idx, cc := range conns {
+					go func(i int, c candConn, s *rawLocalSession, k rawPlayerKey) {
+						replyBuf := make([]byte, 65535)
+						outFrame := make([]byte, 65535+9)
+						outFrame[0] = RawUDPMagicData
+						binary.BigEndian.PutUint16(outFrame[1:3], k.pubPort)
+						copy(outFrame[3:7], k.playerIP[:])
+						binary.BigEndian.PutUint16(outFrame[7:9], k.playerPort)
+
+						for {
+							_ = c.conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+							rn, rErr := c.conn.Read(replyBuf)
+							if rErr != nil {
+								errStr := rErr.Error()
+								if strings.Contains(errStr, "forcibly closed") || strings.Contains(errStr, "connection refused") {
+									continue
+								}
+								return
+							}
+							s.lastActive.Store(time.Now().UnixNano())
+							if s.winnerIdx.Swap(int32(i)) == -1 {
+								log.Printf("[Tunnel Client] <- [RAW UDP] WebRTC reply (%d bytes) from Bedrock at %s", rn, c.label)
+							}
+							copy(outFrame[9:9+rn], replyBuf[:rn])
+							_, _ = rawConn.Write(outFrame[:9+rn])
+						}
+					}(idx, cc, sess, key)
+				}
+			}
+			sess.lastActive.Store(nowNano)
+			sessionsMu.Unlock()
+
+			wIdx := int(sess.winnerIdx.Load())
+			if wIdx >= 0 && wIdx < len(sess.conns) {
+				_, _ = sess.conns[wIdx].conn.Write(payload)
+			} else {
+				for _, c := range sess.conns {
+					_, _ = c.conn.Write(payload)
+				}
+			}
 		}
 	}
 }
@@ -691,32 +967,51 @@ func handleIncomingStream(stream net.Conn, localSignaling, localUDPIP string, lo
 	}
 
 	switch typeBuf[0] {
-	case StreamTypeHTTP, StreamTypeTCP:
-		log.Printf("[Tunnel Client] Forwarding TCP/Signaling stream -> %s", localSignaling)
-		localConn, err := net.DialTimeout("tcp", localSignaling, 5*time.Second)
+	case StreamTypeHTTP, StreamTypeTCP, StreamTypeTCPMapped:
+		targetSignaling := localSignaling
+		if typeBuf[0] == StreamTypeTCPMapped {
+			var portBuf [2]byte
+			if _, err := io.ReadFull(stream, portBuf[:]); err != nil {
+				return
+			}
+			mappedPort := int(binary.BigEndian.Uint16(portBuf[:]))
+			if mappedPort > 0 {
+				host, _, err := net.SplitHostPort(localSignaling)
+				if err != nil || host == "" {
+					host = "127.0.0.1"
+				}
+				targetSignaling = net.JoinHostPort(host, fmt.Sprintf("%d", mappedPort))
+			}
+		}
+
+		localConn, err := net.DialTimeout("tcp", targetSignaling, 5*time.Second)
 		if err != nil {
-			log.Printf("[Tunnel Client] Local Bedrock TCP server unreachable at %s: %v", localSignaling, err)
+			log.Printf("[Tunnel Client] Local Bedrock TCP server unreachable at %s: %v", targetSignaling, err)
 			return
 		}
 		defer localConn.Close()
+		tuneTCPConn(localConn)
 
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			_, _ = io.Copy(localConn, stream)
+			buf := make([]byte, 65536)
+			_, _ = io.CopyBuffer(localConn, stream, buf)
 			if tc, ok := localConn.(*net.TCPConn); ok {
 				_ = tc.CloseWrite()
 			}
 		}()
 		go func() {
 			defer wg.Done()
-			_, _ = io.Copy(stream, localConn)
+			buf := make([]byte, 65536)
+			_, _ = io.CopyBuffer(stream, localConn, buf)
 			_ = stream.Close()
 		}()
 		wg.Wait()
 
 	case StreamTypeUDP:
+		// Automatic Yamux fallback if UDP port 7000 is blocked by a strict local firewall
 		var portBuf [2]byte
 		if _, err := io.ReadFull(stream, portBuf[:]); err != nil {
 			return
@@ -726,37 +1021,7 @@ func handleIncomingStream(stream net.Conn, localSignaling, localUDPIP string, lo
 			targetPort = localUDPDefault
 		}
 
-		type targetSpec struct {
-			netw string
-			addr string
-		}
-		specs := []targetSpec{
-			{"udp4", net.JoinHostPort(localUDPIP, fmt.Sprintf("%d", targetPort))},
-			{"udp4", net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", targetPort))},
-			{"udp6", net.JoinHostPort("::1", fmt.Sprintf("%d", targetPort))},
-		}
-
-		type candConn struct {
-			label string
-			conn  *net.UDPConn
-		}
-		var conns []candConn
-		seen := make(map[string]bool)
-		for _, s := range specs {
-			if seen[s.addr] {
-				continue
-			}
-			seen[s.addr] = true
-			rAddr, err := net.ResolveUDPAddr(s.netw, s.addr)
-			if err != nil {
-				continue
-			}
-			c, err := net.DialUDP(s.netw, nil, rAddr)
-			if err != nil {
-				continue
-			}
-			conns = append(conns, candConn{label: s.addr, conn: c})
-		}
+		conns := buildLocalUDPCandidates(localUDPIP, targetPort)
 		if len(conns) == 0 {
 			return
 		}
@@ -787,7 +1052,7 @@ func handleIncomingStream(stream net.Conn, localSignaling, localUDPIP string, lo
 						return
 					}
 					if winnerIdx.Swap(int32(i)) == -1 {
-						log.Printf("[Tunnel Client] <- SUCCESS! Received first WebRTC UDP reply (%d bytes) from Bedrock at %s!", n, c.label)
+						log.Printf("[Tunnel Client] <- [Yamux Fallback] Received first WebRTC UDP reply (%d bytes) from Bedrock at %s!", n, c.label)
 					}
 					writeMu.Lock()
 					wErr := writeFramedPacket(stream, buf[:n])
@@ -811,10 +1076,14 @@ func handleIncomingStream(stream net.Conn, localSignaling, localUDPIP string, lo
 				_, _ = conns[wIdx].conn.Write(pkt)
 				continue
 			}
-			for _, c := range conns {
+			for _, c := range sessConns(conns) {
 				_ = c.conn.SetWriteDeadline(time.Now().Add(2 * time.Minute))
 				_, _ = c.conn.Write(pkt)
 			}
 		}
 	}
+}
+
+func sessConns(conns []candConn) []candConn {
+	return conns
 }
