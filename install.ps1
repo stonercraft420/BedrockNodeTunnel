@@ -13,7 +13,7 @@ param(
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$Repository = "NotAlive24/BedrockNodeTunnel"
+$Repository = "stonercraft420/BedrockNodeTunnel"
 $ReleaseBase = "https://github.com/$Repository/releases/latest/download"
 $ConfigDir = Join-Path $env:APPDATA "bedrocknode-tunnel"
 
