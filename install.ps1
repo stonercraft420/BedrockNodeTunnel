@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $Repo = "stonercraft420/BedrockNodeTunnel"
@@ -24,9 +24,13 @@ Write-Host "Downloading $($Asset.name)..." -ForegroundColor Cyan
 Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $OutFile -UseBasicParsing
 
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($null -eq $UserPath) { $UserPath = "" }
-if ($UserPath -notlike "*$InstallDir*") {
-    $NewPath = if ($UserPath.EndsWith(";") -or $UserPath -eq "") { "$UserPath$InstallDir" } else { "$UserPath;$InstallDir" }
+if ([string]::IsNullOrEmpty($UserPath)) {
+    $NewPath = $InstallDir
+    [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
+    $env:Path += ";$InstallDir"
+    Write-Host "Added $InstallDir to your user PATH." -ForegroundColor Yellow
+} elseif ($UserPath -notlike "*$InstallDir*") {
+    $NewPath = $UserPath.TrimEnd(';') + ";" + $InstallDir
     [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
     $env:Path += ";$InstallDir"
     Write-Host "Added $InstallDir to your user PATH." -ForegroundColor Yellow
