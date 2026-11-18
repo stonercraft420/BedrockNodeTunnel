@@ -113,6 +113,7 @@ type ServerHandshakeResp struct {
 	UDPStart     int    `json:"udp_start"`
 	UDPEnd       int    `json:"udp_end"`
 	ServerProps  string `json:"server_props"`
+	GeyserConfig string `json:"geyser_config,omitempty"`
 }
 
 func emitJSONEvent(event string, data map[string]any) {
@@ -1165,16 +1166,18 @@ func sendTunnelToken(conn net.Conn, token string) error {
 		if json.Unmarshal(respBytes, &hs) == nil {
 			dash.Logf("Assigned Ports -> TCP %s:%d | UDP %d-%d", hs.PublicIP, hs.TCPPort, hs.UDPStart, hs.UDPEnd)
 			emitJSONEvent("handshake", map[string]any{
-				"status":       "online",
-				"version":      version,
-				"username":     hs.Username,
-				"region_code":  hs.RegionCode,
-				"public_ip":    hs.PublicIP,
-				"subdomain":    hs.Subdomain,
-				"tcp_port":     hs.TCPPort,
-				"udp_start":    hs.UDPStart,
-				"udp_end":      hs.UDPEnd,
-				"server_props": hs.ServerProps,
+				"status":        "online",
+				"version":       version,
+				"username":      hs.Username,
+				"region_code":   hs.RegionCode,
+				"public_ip":     hs.PublicIP,
+				"subdomain":     hs.Subdomain,
+				"server_type":   hs.ServerType,
+				"tcp_port":      hs.TCPPort,
+				"udp_start":     hs.UDPStart,
+				"udp_end":       hs.UDPEnd,
+				"server_props":  hs.ServerProps,
+				"geyser_config": hs.GeyserConfig,
 			})
 		}
 		return nil
