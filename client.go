@@ -88,6 +88,47 @@ var dash = &ConsoleDashboard{
 	LocalTCP: "127.0.0.1:19132",
 }
 
+var jsonMode bool
+
+type ClientHandshakeReq struct {
+	Token    string `json:"token"`
+	Version  string `json:"version"`
+	Client   string `json:"client"`
+	OS       string `json:"os"`
+	Arch     string `json:"arch"`
+	WantJSON bool   `json:"want_json"`
+}
+
+type ServerHandshakeResp struct {
+	OK           bool   `json:"ok"`
+	Username     string `json:"username"`
+	RegionCode   string `json:"region_code"`
+	RegionLabel  string `json:"region_label"`
+	PublicIP     string `json:"public_ip"`
+	BaseDomain   string `json:"base_domain"`
+	Subdomain    string `json:"subdomain"`
+	CustomDomain string `json:"custom_domain,omitempty"`
+	ServerType   string `json:"server_type"`
+	TCPPort      int    `json:"tcp_port"`
+	UDPStart     int    `json:"udp_start"`
+	UDPEnd       int    `json:"udp_end"`
+	ServerProps  string `json:"server_props"`
+}
+
+func emitJSONEvent(event string, data map[string]any) {
+	if !jsonMode {
+		return
+	}
+	if data == nil {
+		data = make(map[string]any)
+	}
+	data["event"] = event
+	data["timestamp"] = time.Now().Unix()
+	if b, err := json.Marshal(data); err == nil {
+		fmt.Println(string(b))
+	}
+}
+
 func (d *ConsoleDashboard) Init(localTCP, localUDP, webURL string) {
 	log.SetOutput(io.Discard)
 	d.mu.Lock()
@@ -95,12 +136,13 @@ func (d *ConsoleDashboard) Init(localTCP, localUDP, webURL string) {
 	d.LocalUDP = localUDP
 	d.mu.Unlock()
 
-	if runtime.GOOS == "windows" {
-		_ = exec.Command("reg", "add", `HKCU\Console`, "/v", "VirtualTerminalLevel", "/t", "REG_DWORD", "/d", "1", "/f").Run()
-		_ = exec.Command("cmd", "/c", "title Bedrock Node Tunnel "+version).Run()
+	if !jsonMode {
+		if runtime.GOOS == "windows" {
+			_ = exec.Command("reg", "add", `HKCU\Console`, "/v", "VirtualTerminalLevel", "/t", "REG_DWORD", "/d", "1", "/f").Run()
+			_ = exec.Command("cmd", "/c", "title Bedrock Node Tunnel "+version).Run()
+		}
+		fmt.Print("\033[?1049h\033[2J\033[H\033[?25l")
 	}
-
-	fmt.Print("\033[?1049h\033[2J\033[H\033[?25l")
 	go d.backgroundLoop()
 	go d.checkVPSVersion(webURL)
 }
@@ -179,9 +221,14 @@ func (d *ConsoleDashboard) SetFastLane(active bool) {
 
 func (d *ConsoleDashboard) SetClaimMode(code string, nodes []RegionNode) {
 	var links []string
-	for _, n := range nodes {
+	claimURL := "https://bedrocknode.net/?claim=" + url.QueryEscape(code)
+	for i, n := range nodes {
 		if n.WebURL != "" {
-			links = append(links, fmt.Sprintf("%-30s %s/?claim=%s", n.Name+":", strings.TrimRight(n.WebURL, "/"), url.QueryEscape(code)))
+			u := fmt.Sprintf("%s/?claim=%s", strings.TrimRight(n.WebURL, "/"), url.QueryEscape(code))
+			if i == 0 {
+				claimURL = u
+			}
+			links = append(links, fmt.Sprintf("%-30s %s", n.Name+":", u))
 		}
 	}
 	d.mu.Lock()
@@ -189,6 +236,10 @@ func (d *ConsoleDashboard) SetClaimMode(code string, nodes []RegionNode) {
 	d.ClaimCode = code
 	d.ClaimLinks = links
 	d.mu.Unlock()
+	emitJSONEvent("claim_required", map[string]any{
+		"claim_code": code,
+		"claim_url":  claimURL,
+	})
 	d.Render()
 }
 
@@ -303,6 +354,9 @@ func formatBytes(b uint64) string {
 }
 
 func (d *ConsoleDashboard) Render() {
+	if jsonMode {
+		return
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -498,6 +552,7 @@ func main() {
 		localUDPDefault int
 		resetToken      bool
 		showVersion     bool
+		handshakeJSON   string
 	)
 
 	flag.StringVar(&nodeFlag, "node", "", "Region code (US, TX, UK, BR, ASIA) or custom VPS domain/IP")
@@ -509,6 +564,8 @@ func main() {
 	flag.IntVar(&localUDPDefault, "local-udp-port", 47334, "Fallback local UDP port on Home PC")
 	flag.BoolVar(&resetToken, "reset-token", false, "Delete the saved tunnel token and claim a new one")
 	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
+	flag.BoolVar(&jsonMode, "json", false, "Output machine-readable JSON events to stdout (for CraftDroid / GUIs)")
+	flag.StringVar(&handshakeJSON, "handshake-json", "", "Optional JSON config payload (token, node, local_http, local_udp_port)")
 	flag.Parse()
 
 	if showVersion {
@@ -520,6 +577,44 @@ func main() {
 	flag.Visit(func(f *flag.Flag) {
 		explicitFlags[f.Name] = true
 	})
+
+	if handshakeJSON != "" {
+		jsonMode = true
+		var cfg struct {
+			Token        string `json:"token"`
+			Node         string `json:"node"`
+			Control      string `json:"control"`
+			Web          string `json:"web"`
+			LocalHTTP    string `json:"local_http"`
+			LocalUDPIP   string `json:"local_udp_ip"`
+			LocalUDPPort int    `json:"local_udp_port"`
+		}
+		if err := json.Unmarshal([]byte(handshakeJSON), &cfg); err == nil {
+			if cfg.Token != "" {
+				token = cfg.Token
+			}
+			if cfg.Node != "" {
+				nodeFlag = cfg.Node
+			}
+			if cfg.Control != "" {
+				controlAddr = cfg.Control
+				explicitFlags["control"] = true
+			}
+			if cfg.Web != "" {
+				webUrl = cfg.Web
+				explicitFlags["web"] = true
+			}
+			if cfg.LocalHTTP != "" {
+				localSignaling = cfg.LocalHTTP
+			}
+			if cfg.LocalUDPIP != "" {
+				localUDPIP = cfg.LocalUDPIP
+			}
+			if cfg.LocalUDPPort > 0 {
+				localUDPDefault = cfg.LocalUDPPort
+			}
+		}
+	}
 
 	token = strings.TrimSpace(token)
 	if token != "" && !isValidToken(token) {
@@ -1019,10 +1114,33 @@ func obtainOrClaimToken(customControl, customWeb, flagToken string) (string, str
 	}
 }
 
+var useLegacyAuth atomic.Bool
+
 func sendTunnelToken(conn net.Conn, token string) error {
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	defer conn.SetWriteDeadline(time.Time{})
-	if err := writeFramedPacket(conn, []byte(token)); err != nil {
+
+	var payload []byte
+	sentJSON := false
+	if !useLegacyAuth.Load() {
+		req := ClientHandshakeReq{
+			Token:    token,
+			Version:  version,
+			Client:   "nethernet-client",
+			OS:       runtime.GOOS,
+			Arch:     runtime.GOARCH,
+			WantJSON: true,
+		}
+		if b, err := json.Marshal(req); err == nil {
+			payload = b
+			sentJSON = true
+		}
+	}
+	if len(payload) == 0 {
+		payload = []byte(token)
+	}
+
+	if err := writeFramedPacket(conn, payload); err != nil {
 		return err
 	}
 	var ack [1]byte
@@ -1036,10 +1154,39 @@ func sendTunnelToken(conn net.Conn, token string) error {
 	}
 	switch ack[0] {
 	case 0x01:
+		emitJSONEvent("connected", map[string]any{"status": "online", "version": version})
+		return nil
+	case 0x03:
+		respBytes, err := readFramedPacket(conn)
+		if err != nil {
+			return err
+		}
+		var hs ServerHandshakeResp
+		if json.Unmarshal(respBytes, &hs) == nil {
+			dash.Logf("Assigned Ports -> TCP %s:%d | UDP %d-%d", hs.PublicIP, hs.TCPPort, hs.UDPStart, hs.UDPEnd)
+			emitJSONEvent("handshake", map[string]any{
+				"status":       "online",
+				"version":      version,
+				"username":     hs.Username,
+				"region_code":  hs.RegionCode,
+				"public_ip":    hs.PublicIP,
+				"subdomain":    hs.Subdomain,
+				"tcp_port":     hs.TCPPort,
+				"udp_start":    hs.UDPStart,
+				"udp_end":      hs.UDPEnd,
+				"server_props": hs.ServerProps,
+			})
+		}
 		return nil
 	case 0x02:
 		return errTunnelAlreadyActive
+	case 0x04:
+		return errInvalidToken
 	default:
+		if sentJSON {
+			useLegacyAuth.Store(true)
+			return errors.New("retrying with legacy token format")
+		}
 		return errInvalidToken
 	}
 }
