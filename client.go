@@ -15,12 +15,14 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -37,10 +39,11 @@ const (
 	nodeSaveFile         = "bedrocknode-node.txt"
 	localLockAddr        = "127.0.0.1:47339"
 	maxTokenLength       = 4096
+	maxLogLines          = 6
 	handshakeHint        = 5
 )
 
-var version = "v1.3.0"
+var version = "v1.4.0"
 
 var (
 	errInvalidToken        = errors.New("invalid auth token rejected by server")
@@ -60,6 +63,40 @@ const (
 
 var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
+type ExtraTunnelInfo struct {
+	Slot       int    `json:"slot"`
+	Name       string `json:"name"`
+	ServerType string `json:"server_type,omitempty"`
+	LocalTCP   int    `json:"local_tcp"`
+	TCPPort    int    `json:"tcp_port"`
+	UDPStart   int    `json:"udp_start"`
+	UDPEnd     int    `json:"udp_end"`
+	Disabled   bool   `json:"disabled,omitempty"`
+}
+
+type TunnelDisplay struct {
+	Slot       int
+	RegionCode string
+	Name       string
+	ServerType string
+	PublicPort int
+	LocalAddr  string
+	UDPStart   int
+	UDPEnd     int
+	Disabled   bool
+	Up         bool
+}
+
+type RegionStatus struct {
+	Code        string
+	Name        string
+	ControlAddr string
+	State       string
+	FastLaneOn  bool
+	ConnectedAt time.Time
+	Tunnels     []TunnelDisplay
+}
+
 type ConsoleDashboard struct {
 	mu            sync.Mutex
 	State         string
@@ -69,6 +106,7 @@ type ConsoleDashboard struct {
 	LatestVersion string
 	FastLaneOn    bool
 	LocalTCP      string
+	LocalHost     string
 	LocalUDP      string
 	ServerUp      bool
 	ClaimCode     string
@@ -76,6 +114,11 @@ type ConsoleDashboard struct {
 	ConnectedAt   time.Time
 	Logs          []string
 	lastRawLog    string
+	Headless      bool
+	MultiRegion   bool
+	RegionOrder   []string
+	Regions       map[string]*RegionStatus
+	Tunnels       []TunnelDisplay
 
 	ActiveUDP atomic.Int32
 	BytesIn   atomic.Uint64
@@ -83,9 +126,11 @@ type ConsoleDashboard struct {
 }
 
 var dash = &ConsoleDashboard{
-	State:    "CONNECTING",
-	HubName:  "Auto-Detecting Closest Hub...",
-	LocalTCP: "127.0.0.1:19132",
+	State:     "CONNECTING",
+	HubName:   "Auto-Detecting Closest Hub...",
+	LocalTCP:  "127.0.0.1:19132",
+	LocalHost: "127.0.0.1",
+	Regions:   make(map[string]*RegionStatus),
 }
 
 var jsonMode bool
@@ -100,20 +145,46 @@ type ClientHandshakeReq struct {
 }
 
 type ServerHandshakeResp struct {
-	OK           bool   `json:"ok"`
-	Username     string `json:"username"`
-	RegionCode   string `json:"region_code"`
-	RegionLabel  string `json:"region_label"`
-	PublicIP     string `json:"public_ip"`
-	BaseDomain   string `json:"base_domain"`
-	Subdomain    string `json:"subdomain"`
-	CustomDomain string `json:"custom_domain,omitempty"`
-	ServerType   string `json:"server_type"`
-	TCPPort      int    `json:"tcp_port"`
-	UDPStart     int    `json:"udp_start"`
-	UDPEnd       int    `json:"udp_end"`
-	ServerProps  string `json:"server_props"`
-	GeyserConfig string `json:"geyser_config,omitempty"`
+	OK              bool              `json:"ok"`
+	Username        string            `json:"username"`
+	RegionCode      string            `json:"region_code"`
+	RegionLabel     string            `json:"region_label"`
+	PublicIP        string            `json:"public_ip"`
+	BaseDomain      string            `json:"base_domain"`
+	Subdomain       string            `json:"subdomain"`
+	CustomDomain    string            `json:"custom_domain,omitempty"`
+	PrimaryName     string            `json:"primary_name,omitempty"`
+	LocalTCP        int               `json:"local_tcp,omitempty"`
+	PrimaryDisabled bool              `json:"primary_disabled,omitempty"`
+	ServerType      string            `json:"server_type"`
+	TCPPort         int               `json:"tcp_port"`
+	UDPStart        int               `json:"udp_start"`
+	UDPEnd          int               `json:"udp_end"`
+	ServerProps     string            `json:"server_props"`
+	GeyserConfig    string            `json:"geyser_config,omitempty"`
+	ExtraTunnels    []ExtraTunnelInfo `json:"extra_tunnels,omitempty"`
+}
+
+func isInteractiveTTY() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+func enableTerminalUI(title string) {
+	if runtime.GOOS == "windows" {
+		_ = exec.Command("reg", "add", `HKCU\Console`, "/v", "VirtualTerminalLevel", "/t", "REG_DWORD", "/d", "1", "/f").Run()
+		if title != "" {
+			_ = exec.Command("cmd", "/c", "title "+title).Run()
+		}
+	}
+	fmt.Print("\033[?1049h\033[2J\033[H\033[?25l")
+}
+
+func restoreTerminalUI() {
+	fmt.Print("\033[?25h\033[?1049l")
 }
 
 func emitJSONEvent(event string, data map[string]any) {
@@ -132,20 +203,57 @@ func emitJSONEvent(event string, data map[string]any) {
 
 func (d *ConsoleDashboard) Init(localTCP, localUDP, webURL string) {
 	log.SetOutput(io.Discard)
+	host, _, err := net.SplitHostPort(localTCP)
+	if err != nil || host == "" {
+		host = "127.0.0.1"
+	}
+
+	headless := !jsonMode && !isInteractiveTTY()
+
 	d.mu.Lock()
 	d.LocalTCP = localTCP
+	d.LocalHost = host
 	d.LocalUDP = localUDP
+	d.Headless = headless
+	if d.Regions == nil {
+		d.Regions = make(map[string]*RegionStatus)
+	}
 	d.mu.Unlock()
 
-	if !jsonMode {
-		if runtime.GOOS == "windows" {
-			_ = exec.Command("reg", "add", `HKCU\Console`, "/v", "VirtualTerminalLevel", "/t", "REG_DWORD", "/d", "1", "/f").Run()
-			_ = exec.Command("cmd", "/c", "title Bedrock Node Tunnel "+version).Run()
-		}
-		fmt.Print("\033[?1049h\033[2J\033[H\033[?25l")
+	if !jsonMode && !headless {
+		enableTerminalUI("Bedrock Node Tunnel " + version)
 	}
 	go d.backgroundLoop()
 	go d.checkVPSVersion(webURL)
+}
+
+func normalizeVersion(v string) string {
+	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(v)), "v")
+}
+
+func isNewerVersion(remote, current string) bool {
+	rParts := strings.Split(normalizeVersion(remote), ".")
+	cParts := strings.Split(normalizeVersion(current), ".")
+	maxLen := len(rParts)
+	if len(cParts) > maxLen {
+		maxLen = len(cParts)
+	}
+	for i := 0; i < maxLen; i++ {
+		var rv, cv int
+		if i < len(rParts) {
+			_, _ = fmt.Sscanf(rParts[i], "%d", &rv)
+		}
+		if i < len(cParts) {
+			_, _ = fmt.Sscanf(cParts[i], "%d", &cv)
+		}
+		if rv > cv {
+			return true
+		}
+		if rv < cv {
+			return false
+		}
+	}
+	return false
 }
 
 func (d *ConsoleDashboard) checkVPSVersion(webURL string) {
@@ -167,7 +275,8 @@ func (d *ConsoleDashboard) checkVPSVersion(webURL string) {
 		return
 	}
 	remoteVer := strings.TrimSpace(string(body))
-	if remoteVer != "" && len(remoteVer) <= 16 && strings.HasPrefix(remoteVer, "v") && !strings.EqualFold(remoteVer, version) {
+	if remoteVer != "" && len(remoteVer) <= 16 && strings.HasPrefix(strings.ToLower(remoteVer), "v") &&
+		isNewerVersion(remoteVer, version) {
 		d.mu.Lock()
 		d.LatestVersion = remoteVer
 		d.mu.Unlock()
@@ -182,7 +291,6 @@ func (d *ConsoleDashboard) SetState(state, hubName, hubAddr string, fastLane boo
 	}
 	if state != "ONLINE" {
 		d.FastLaneOn = false
-		d.ActiveUDP.Store(0)
 	} else {
 		d.FastLaneOn = fastLane
 	}
@@ -197,11 +305,151 @@ func (d *ConsoleDashboard) SetState(state, hubName, hubAddr string, fastLane boo
 	d.Render()
 }
 
+func (d *ConsoleDashboard) UpdateRegionState(code, name, ctrlAddr, state string, fastLane bool) {
+	d.mu.Lock()
+	if d.Regions == nil {
+		d.Regions = make(map[string]*RegionStatus)
+	}
+	rs, exists := d.Regions[code]
+	if !exists {
+		rs = &RegionStatus{Code: code, Name: name, ControlAddr: ctrlAddr}
+		d.Regions[code] = rs
+		d.RegionOrder = append(d.RegionOrder, code)
+	}
+	if name != "" {
+		rs.Name = name
+	}
+	if ctrlAddr != "" {
+		rs.ControlAddr = ctrlAddr
+	}
+	if state == "ONLINE" && rs.State != "ONLINE" {
+		rs.ConnectedAt = time.Now()
+	}
+	if state != "ONLINE" {
+		rs.FastLaneOn = false
+	} else {
+		rs.FastLaneOn = fastLane
+	}
+	rs.State = state
+
+	if d.MultiRegion {
+		anyOnline := false
+		anyFast := false
+		for _, r := range d.Regions {
+			if r.State == "ONLINE" {
+				anyOnline = true
+				if d.ConnectedAt.IsZero() {
+					d.ConnectedAt = r.ConnectedAt
+				}
+			}
+			if r.FastLaneOn {
+				anyFast = true
+			}
+		}
+		if anyOnline {
+			d.State = "ONLINE"
+		} else {
+			d.State = "CONNECTING"
+		}
+		d.FastLaneOn = anyFast
+		d.HubName = fmt.Sprintf("%d Regional Hubs Active", len(d.Regions))
+		d.HubAddr = ""
+	}
+	d.mu.Unlock()
+	d.Render()
+}
+
+func (d *ConsoleDashboard) SetRegionFastLane(code string, active bool) {
+	d.mu.Lock()
+	if rs, ok := d.Regions[code]; ok {
+		rs.FastLaneOn = active
+	}
+	if !d.MultiRegion {
+		d.FastLaneOn = active
+	} else {
+		anyFast := false
+		for _, r := range d.Regions {
+			if r.FastLaneOn {
+				anyFast = true
+			}
+		}
+		d.FastLaneOn = anyFast
+	}
+	d.mu.Unlock()
+	d.Render()
+}
+
+func (d *ConsoleDashboard) UpdateHandshakeTunnels(regionCode string, hs ServerHandshakeResp) {
+	d.mu.Lock()
+	host := d.LocalHost
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	defaultLocal := d.LocalTCP
+
+	var list []TunnelDisplay
+	if hs.TCPPort > 0 {
+		localAddr := defaultLocal
+		if hs.LocalTCP > 0 {
+			localAddr = net.JoinHostPort(host, fmt.Sprintf("%d", hs.LocalTCP))
+		}
+		pName := hs.PrimaryName
+		if pName == "" {
+			pName = "Server #1"
+		}
+		list = append(list, TunnelDisplay{
+			Slot:       1,
+			RegionCode: regionCode,
+			Name:       pName,
+			ServerType: hs.ServerType,
+			PublicPort: hs.TCPPort,
+			LocalAddr:  localAddr,
+			UDPStart:   hs.UDPStart,
+			UDPEnd:     hs.UDPEnd,
+			Disabled:   hs.PrimaryDisabled,
+		})
+	}
+	for _, et := range hs.ExtraTunnels {
+		if et.TCPPort <= 0 {
+			continue
+		}
+		lPort := et.LocalTCP
+		if lPort <= 0 {
+			lPort = 19132 + ((et.Slot - 1) * 2)
+		}
+		eName := et.Name
+		if eName == "" {
+			eName = fmt.Sprintf("Server #%d", et.Slot)
+		}
+		list = append(list, TunnelDisplay{
+			Slot:       et.Slot,
+			RegionCode: regionCode,
+			Name:       eName,
+			ServerType: et.ServerType,
+			PublicPort: et.TCPPort,
+			LocalAddr:  net.JoinHostPort(host, fmt.Sprintf("%d", lPort)),
+			UDPStart:   et.UDPStart,
+			UDPEnd:     et.UDPEnd,
+			Disabled:   et.Disabled,
+		})
+	}
+
+	if d.MultiRegion {
+		if rs, ok := d.Regions[regionCode]; ok {
+			rs.Tunnels = list
+		}
+	} else {
+		d.Tunnels = list
+	}
+	d.mu.Unlock()
+	d.probeLocalServers()
+	d.Render()
+}
+
 func (d *ConsoleDashboard) SetAlreadyActive(hubName, hubAddr, reason string) {
 	d.mu.Lock()
 	d.State = "ALREADY_ACTIVE"
 	d.FastLaneOn = false
-	d.ActiveUDP.Store(0)
 	if hubName != "" {
 		d.HubName = hubName
 	}
@@ -241,6 +489,9 @@ func (d *ConsoleDashboard) SetClaimMode(code string, nodes []RegionNode) {
 		"claim_code": code,
 		"claim_url":  claimURL,
 	})
+	if d.Headless && !jsonMode {
+		fmt.Printf("[%s] ACTION REQUIRED — Claim Code: %s | Link: %s\n", time.Now().Format("15:04:05"), code, claimURL)
+	}
 	d.Render()
 }
 
@@ -258,11 +509,87 @@ func (d *ConsoleDashboard) Logf(format string, args ...any) {
 
 	line := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), msg)
 	d.Logs = append(d.Logs, line)
-	if len(d.Logs) > 4 {
-		d.Logs = d.Logs[len(d.Logs)-4:]
+	if len(d.Logs) > maxLogLines {
+		d.Logs = d.Logs[len(d.Logs)-maxLogLines:]
+	}
+	headless := d.Headless
+	d.mu.Unlock()
+
+	if headless && !jsonMode {
+		fmt.Println(line)
+	}
+	d.Render()
+}
+
+func checkTCPPortUp(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func (d *ConsoleDashboard) probeLocalServers() bool {
+	d.mu.Lock()
+	primaryTarget := d.LocalTCP
+	prevPrimary := d.ServerUp
+	multi := d.MultiRegion
+	var addrs []string
+	seen := make(map[string]bool)
+	addAddr := func(a string) {
+		if a != "" && !seen[a] {
+			seen[a] = true
+			addrs = append(addrs, a)
+		}
+	}
+	addAddr(primaryTarget)
+	if multi {
+		for _, rs := range d.Regions {
+			for _, tn := range rs.Tunnels {
+				addAddr(tn.LocalAddr)
+			}
+		}
+	} else {
+		for _, tn := range d.Tunnels {
+			addAddr(tn.LocalAddr)
+		}
 	}
 	d.mu.Unlock()
-	d.Render()
+
+	results := make(map[string]bool, len(addrs))
+	for _, a := range addrs {
+		results[a] = checkTCPPortUp(a)
+	}
+
+	changed := false
+	d.mu.Lock()
+	if up, ok := results[primaryTarget]; ok && up != prevPrimary {
+		d.ServerUp = up
+		changed = true
+	}
+	if multi {
+		for _, rs := range d.Regions {
+			for i := range rs.Tunnels {
+				if up, ok := results[rs.Tunnels[i].LocalAddr]; ok && up != rs.Tunnels[i].Up {
+					rs.Tunnels[i].Up = up
+					changed = true
+				}
+			}
+		}
+	} else {
+		for i := range d.Tunnels {
+			if up, ok := results[d.Tunnels[i].LocalAddr]; ok && up != d.Tunnels[i].Up {
+				d.Tunnels[i].Up = up
+				changed = true
+			}
+		}
+	}
+	d.mu.Unlock()
+	return changed
 }
 
 func (d *ConsoleDashboard) backgroundLoop() {
@@ -271,8 +598,6 @@ func (d *ConsoleDashboard) backgroundLoop() {
 	for range ticker.C {
 		d.mu.Lock()
 		state := d.State
-		target := d.LocalTCP
-		prevUp := d.ServerUp
 		d.mu.Unlock()
 
 		if state == "ALREADY_ACTIVE" || state == "CLAIM" {
@@ -282,17 +607,7 @@ func (d *ConsoleDashboard) backgroundLoop() {
 		ticks++
 		statusChanged := false
 		if ticks%3 == 1 {
-			conn, err := net.DialTimeout("tcp", target, 250*time.Millisecond)
-			up := err == nil
-			if conn != nil {
-				_ = conn.Close()
-			}
-			if up != prevUp {
-				d.mu.Lock()
-				d.ServerUp = up
-				d.mu.Unlock()
-				statusChanged = true
-			}
+			statusChanged = d.probeLocalServers()
 		}
 
 		if state == "ONLINE" || statusChanged {
@@ -302,7 +617,7 @@ func (d *ConsoleDashboard) backgroundLoop() {
 }
 
 func runeDisplayWidth(r rune) int {
-	if r >= 0x1F300 {
+	if r >= 0x1F300 || r == 0x26A1 {
 		return 2
 	}
 	return 1
@@ -354,10 +669,7 @@ func formatBytes(b uint64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-func (d *ConsoleDashboard) Render() {
-	if jsonMode {
-		return
-	}
+func (d *ConsoleDashboard) BuildFrame(footer string) string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -384,6 +696,9 @@ func (d *ConsoleDashboard) Render() {
 	case "ONLINE":
 		statusBadge = cGreen + cBold + "● ONLINE" + cReset
 		up := time.Since(d.ConnectedAt).Round(time.Second)
+		if d.ConnectedAt.IsZero() {
+			up = 0
+		}
 		uptimeStr = fmt.Sprintf("%02dh %02dm %02ds", int(up.Hours()), int(up.Minutes())%60, int(up.Seconds())%60)
 	case "ALREADY_ACTIVE":
 		statusBadge = cYellow + cBold + "● ALREADY RUNNING (Active Elsewhere)" + cReset
@@ -438,25 +753,72 @@ func (d *ConsoleDashboard) Render() {
 		} else if d.FastLaneOn {
 			fastLaneBadge = cGreen + cBold + "● ACTIVE" + cReset + " (WebRTC Bypassed TCP)"
 		}
+		b.WriteString(padBoxLine(fmt.Sprintf("   %-16s :  %s", "UDP FAST-LANE", fastLaneBadge), boxW))
 
-		serverBadge := cRed + "● NOT DETECTED" + cReset + fmt.Sprintf(" (Start server on %s)", d.LocalTCP)
-		if d.ServerUp {
-			serverBadge = cGreen + cBold + "● RUNNING" + cReset + fmt.Sprintf(" (%s)", d.LocalTCP)
+		if d.MultiRegion && len(d.RegionOrder) > 0 {
+			for _, code := range d.RegionOrder {
+				rs := d.Regions[code]
+				if rs == nil {
+					continue
+				}
+				rBadge := cRed + "● OFFLINE" + cReset
+				if rs.State == "ONLINE" {
+					if rs.FastLaneOn {
+						rBadge = cGreen + cBold + "● ONLINE (Fast-Lane)" + cReset
+					} else {
+						rBadge = cGreen + "● ONLINE" + cReset
+					}
+				} else if rs.State == "CONNECTING" {
+					rBadge = cYellow + "◐ CONNECTING" + cReset
+				}
+				portNote := ""
+				if len(rs.Tunnels) > 0 {
+					var ps []string
+					for _, tn := range rs.Tunnels {
+						ps = append(ps, fmt.Sprintf(":%d->%s", tn.PublicPort, tn.LocalAddr))
+					}
+					portNote = " " + cGray + "[" + strings.Join(ps, ", ") + "]" + cReset
+				}
+				b.WriteString(padBoxLine(fmt.Sprintf("   %-16s :  %s%s", "HUB "+rs.Code, rBadge, portNote), boxW))
+			}
+		} else if len(d.Tunnels) > 0 {
+			for _, tn := range d.Tunnels {
+				label := fmt.Sprintf("SERVER #%d", tn.Slot)
+				var sBadge string
+				if tn.Disabled {
+					sBadge = cYellow + "⏸ PAUSED" + cReset
+				} else if tn.Up {
+					sBadge = cGreen + cBold + "● RUNNING" + cReset
+				} else {
+					sBadge = cRed + "● NOT DETECTED" + cReset
+				}
+				typeTag := "BDS"
+				if strings.EqualFold(tn.ServerType, "geyser") {
+					typeTag = "Geyser"
+				}
+				info := fmt.Sprintf("%s  %s[%s]%s  Public :%d → %s",
+					sBadge, cCyan, typeTag, cReset, tn.PublicPort, tn.LocalAddr)
+				b.WriteString(padBoxLine(fmt.Sprintf("   %-16s :  %s", label, info), boxW))
+			}
+		} else {
+			serverBadge := cRed + "● NOT DETECTED" + cReset + fmt.Sprintf(" (Start server on %s)", d.LocalTCP)
+			if d.ServerUp {
+				serverBadge = cGreen + cBold + "● RUNNING" + cReset + fmt.Sprintf(" (%s)", d.LocalTCP)
+			}
+			b.WriteString(padBoxLine(fmt.Sprintf("   %-16s :  %s", "BEDROCK SERVER", serverBadge), boxW))
 		}
 
 		activePlayers := d.ActiveUDP.Load()
 		inStr := formatBytes(d.BytesIn.Load())
 		outStr := formatBytes(d.BytesOut.Load())
 
-		b.WriteString(padBoxLine(fmt.Sprintf("   %-16s :  %s", "UDP FAST-LANE", fastLaneBadge), boxW))
-		b.WriteString(padBoxLine(fmt.Sprintf("   %-16s :  %s", "BEDROCK SERVER", serverBadge), boxW))
 		b.WriteString(padBoxLine(fmt.Sprintf("   %-16s :  %d Active Player UDP Streams", "UDP SESSIONS", activePlayers), boxW))
 		b.WriteString(padBoxLine(fmt.Sprintf("   %-16s :  ↓ %-12s In   |   ↑ %-12s Out", "LIVE TRAFFIC", inStr, outStr), boxW))
 	}
 
 	b.WriteString(borderMid)
 	b.WriteString(padBoxLine(cBold+"   RECENT ACTIVITY"+cReset, boxW))
-	for i := 0; i < 4; i++ {
+	for i := 0; i < maxLogLines; i++ {
 		if i < len(d.Logs) {
 			b.WriteString(padBoxLine("   "+cGray+d.Logs[i]+cReset, boxW))
 		} else {
@@ -464,10 +826,29 @@ func (d *ConsoleDashboard) Render() {
 		}
 	}
 	b.WriteString(borderBot)
-	b.WriteString("   Keep this window open while hosting. Press Ctrl+C to stop the tunnel.\033[J")
-
-	_, _ = os.Stdout.WriteString(b.String())
+	if footer == "" {
+		footer = "Keep this window open while hosting. Press Ctrl+C to stop the tunnel."
+	}
+	b.WriteString("   " + footer + "\033[J")
+	return b.String()
 }
+
+func (d *ConsoleDashboard) Render() {
+	if jsonMode {
+		return
+	}
+	d.mu.Lock()
+	headless := d.Headless
+	d.mu.Unlock()
+	if headless {
+		return
+	}
+	_, _ = os.Stdout.WriteString(d.BuildFrame(""))
+}
+
+// ============================================================================
+// LOCAL INSTANCE LOCK + LIVE "screen -r" STYLE ATTACH SERVER (127.0.0.1:47339)
+// ============================================================================
 
 func acquireLocalInstanceLock() net.Listener {
 	ln, err := net.Listen("tcp", localLockAddr)
@@ -475,6 +856,82 @@ func acquireLocalInstanceLock() net.Listener {
 		return nil
 	}
 	return ln
+}
+
+func serveLocalAttachViewers(ln net.Listener) {
+	const attachedFooter = "Attached to running background tunnel. Press Ctrl+C to detach (tunnel keeps running)."
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+
+			sendFrame := func() error {
+				frame := dash.BuildFrame(attachedFooter)
+				_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				return writeFramedPacket(c, []byte(frame))
+			}
+
+			if err := sendFrame(); err != nil {
+				return
+			}
+			for range ticker.C {
+				if err := sendFrame(); err != nil {
+					return
+				}
+			}
+		}(conn)
+	}
+}
+
+func attachToRunningClient() bool {
+	conn, err := net.DialTimeout("tcp", localLockAddr, 2*time.Second)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	interactive := isInteractiveTTY()
+	if interactive {
+		enableTerminalUI("Bedrock Node Tunnel " + version + " (Attached)")
+		defer restoreTerminalUI()
+	}
+
+	doneCh := make(chan error, 1)
+	go func() {
+		for {
+			frame, err := readFramedPacket(conn)
+			if err != nil {
+				doneCh <- err
+				return
+			}
+			_, _ = os.Stdout.Write(frame)
+		}
+	}()
+
+	select {
+	case <-sigCh:
+		_ = conn.Close()
+		if interactive {
+			restoreTerminalUI()
+		}
+		fmt.Println("Detached from Bedrock Node Tunnel (background tunnel is still running).")
+		return true
+	case <-doneCh:
+		if interactive {
+			restoreTerminalUI()
+		}
+		fmt.Println("Running Bedrock Node Tunnel session closed.")
+		return true
+	}
 }
 
 type RegionNode struct {
@@ -515,6 +972,12 @@ var defaultRegionNodes = []RegionNode{
 		WebURL:      "https://asia.bedrocknode.net",
 		ControlAddr: "45.32.121.108:7000",
 	},
+	{
+		Code:        "OC",
+		Name:        "Oceania (Sydney Hub)",
+		WebURL:      "https://oceania.bedrocknode.net",
+		ControlAddr: "139.180.162.173:7000",
+	},
 }
 
 type rawPlayerKey struct {
@@ -542,9 +1005,17 @@ func (s *rawLocalSession) Close() {
 	}
 }
 
+type TokenTarget struct {
+	ControlAddr string
+	Token       string
+	Label       string
+	Code        string
+}
+
 func main() {
 	var (
 		nodeFlag        string
+		nodesFlag       string
 		controlAddr     string
 		webUrl          string
 		token           string
@@ -556,7 +1027,8 @@ func main() {
 		handshakeJSON   string
 	)
 
-	flag.StringVar(&nodeFlag, "node", "", "Region code (US, TX, UK, BR, ASIA) or custom VPS domain/IP")
+	flag.StringVar(&nodeFlag, "node", "", "Region code (US, TX, UK, BR, ASIA, OC) or custom VPS domain/IP")
+	flag.StringVar(&nodesFlag, "nodes", "", "Comma-separated regions to connect simultaneously (e.g. US,TX,UK or all)")
 	flag.StringVar(&controlAddr, "control", "", "Bedrock Node Tunnel VPS control address (auto-detected across regions if empty)")
 	flag.StringVar(&webUrl, "web", "https://bedrocknode.net", "Bedrock Node Tunnel Web Dashboard URL")
 	flag.StringVar(&token, "token", "", "Tunnel token (leave empty for automatic browser claim)")
@@ -660,15 +1132,16 @@ func main() {
 		_ = saveNodeAddr(controlAddr)
 	}
 
-	if localUDPIP == "" {
-		localUDPIP = detectOutboundLANIP()
-	}
-
-	dash.Init(localSignaling, localUDPIP, cleanWebURL)
-	dash.Logf("Starting Bedrock Node Tunnel %s (Local UDP IP: %s)", version, localUDPIP)
-
+	// Check if another instance/service is already running on this PC BEFORE taking over the screen
 	lockLn := acquireLocalInstanceLock()
 	if lockLn == nil {
+		if !jsonMode && !resetToken && attachToRunningClient() {
+			return
+		}
+		if localUDPIP == "" {
+			localUDPIP = detectOutboundLANIP()
+		}
+		dash.Init(localSignaling, localUDPIP, cleanWebURL)
 		savedHub := loadSavedNodeAddr()
 		hubInfo := resolveNodeInput(savedHub)
 		dash.SetAlreadyActive(hubInfo.Name, savedHub, "Bedrock Node Tunnel is already open on this PC")
@@ -680,14 +1153,141 @@ func main() {
 				break
 			}
 		}
+	} else {
+		if localUDPIP == "" {
+			localUDPIP = detectOutboundLANIP()
+		}
+		dash.Init(localSignaling, localUDPIP, cleanWebURL)
 	}
 	defer func() {
 		if lockLn != nil {
 			_ = lockLn.Close()
 		}
+		if !jsonMode && !dash.Headless {
+			restoreTerminalUI()
+		}
 	}()
 
+	// Restore terminal cleanly on Ctrl+C / SIGTERM
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		if lockLn != nil {
+			_ = lockLn.Close()
+		}
+		if !jsonMode && !dash.Headless {
+			restoreTerminalUI()
+		}
+		os.Exit(0)
+	}()
+
+	go serveLocalAttachViewers(lockLn)
+
+	dash.Logf("Starting Bedrock Node Tunnel %s (Local UDP IP: %s)", version, localUDPIP)
+
+	// Multi-region mode: either via multi-line bedrocknode-token.txt or -nodes flag
+	if targets := resolveMultiRegionTargets(nodesFlag, token); len(targets) > 1 {
+		dash.mu.Lock()
+		dash.MultiRegion = true
+		dash.mu.Unlock()
+		dash.Logf("Multi-Region Mode: connecting to %d hubs simultaneously...", len(targets))
+		runMultiRegionClients(targets, localSignaling, localUDPIP, localUDPDefault)
+		return
+	}
+
 	runClient(controlAddr, pollWebOverride, token, localSignaling, localUDPIP, localUDPDefault)
+}
+
+func resolveMultiRegionTargets(nodesFlag, flagToken string) []TokenTarget {
+	// 1. Check multi-line token file (e.g. one "US|bnode_xxx" per line)
+	if flagToken == "" {
+		if multi := loadSavedMultiTokens(); len(multi) > 1 {
+			return multi
+		}
+	}
+	// 2. Check explicit -nodes flag (e.g. -nodes US,TX,UK or -nodes all)
+	nodesFlag = strings.TrimSpace(nodesFlag)
+	if nodesFlag == "" {
+		return nil
+	}
+	tok := flagToken
+	if tok == "" {
+		saved, _ := loadSavedToken()
+		_, tok = splitOptionalNodeToken(saved)
+	}
+	if !isValidToken(tok) {
+		return nil
+	}
+
+	var targets []TokenTarget
+	seen := make(map[string]bool)
+	if strings.EqualFold(nodesFlag, "all") {
+		for _, n := range getActiveNodeList("", "") {
+			if seen[n.ControlAddr] {
+				continue
+			}
+			seen[n.ControlAddr] = true
+			targets = append(targets, TokenTarget{
+				ControlAddr: n.ControlAddr,
+				Token:       tok,
+				Label:       n.Name,
+				Code:        n.Code,
+			})
+		}
+		return targets
+	}
+	for _, part := range strings.Split(nodesFlag, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		n := resolveNodeInput(part)
+		if n.ControlAddr == "" || seen[n.ControlAddr] {
+			continue
+		}
+		seen[n.ControlAddr] = true
+		targets = append(targets, TokenTarget{
+			ControlAddr: n.ControlAddr,
+			Token:       tok,
+			Label:       n.Name,
+			Code:        n.Code,
+		})
+	}
+	return targets
+}
+
+func loadSavedMultiTokens() []TokenTarget {
+	for _, p := range candidateTokenPaths() {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var targets []TokenTarget
+		seen := make(map[string]bool)
+		for _, rawLine := range strings.Split(string(data), "\n") {
+			line := strings.TrimSpace(rawLine)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			ctrl, tok := splitOptionalNodeToken(line)
+			if ctrl == "" || !isValidToken(tok) || seen[ctrl] {
+				continue
+			}
+			seen[ctrl] = true
+			info := resolveNodeInput(ctrl)
+			targets = append(targets, TokenTarget{
+				ControlAddr: ctrl,
+				Token:       tok,
+				Label:       info.Name,
+				Code:        info.Code,
+			})
+		}
+		if len(targets) > 1 {
+			return targets
+		}
+	}
+	return nil
 }
 
 func resolveNodeInput(input string) RegionNode {
@@ -706,6 +1306,8 @@ func resolveNodeInput(input string) RegionNode {
 		upper = "BR"
 	case "SG", "SINGAPORE", "AP":
 		upper = "ASIA"
+	case "OCEANIA", "SYDNEY", "AU", "AUS", "NZ":
+		upper = "OC"
 	case "USEAST", "US-EAST":
 		upper = "US"
 	}
@@ -847,9 +1449,14 @@ func candidateNodePaths() []string {
 func loadSavedToken() (string, string) {
 	for _, p := range candidateTokenPaths() {
 		if data, err := os.ReadFile(p); err == nil {
-			saved := strings.TrimSpace(string(data))
-			if isValidToken(saved) {
-				return saved, p
+			for _, rawLine := range strings.Split(string(data), "\n") {
+				saved := strings.TrimSpace(rawLine)
+				if saved == "" || strings.HasPrefix(saved, "#") {
+					continue
+				}
+				if isValidToken(saved) {
+					return saved, p
+				}
 			}
 		}
 	}
@@ -1117,7 +1724,7 @@ func obtainOrClaimToken(customControl, customWeb, flagToken string) (string, str
 
 var useLegacyAuth atomic.Bool
 
-func sendTunnelToken(conn net.Conn, token string) error {
+func sendTunnelToken(conn net.Conn, token string) (*ServerHandshakeResp, error) {
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	defer conn.SetWriteDeadline(time.Time{})
 
@@ -1142,29 +1749,33 @@ func sendTunnelToken(conn net.Conn, token string) error {
 	}
 
 	if err := writeFramedPacket(conn, payload); err != nil {
-		return err
+		return nil, err
 	}
 	var ack [1]byte
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
 	if _, err := io.ReadFull(conn, ack[:]); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return errTunnelAlreadyActive
+			return nil, errTunnelAlreadyActive
 		}
-		return err
+		return nil, err
 	}
 	switch ack[0] {
 	case 0x01:
 		emitJSONEvent("connected", map[string]any{"status": "online", "version": version})
-		return nil
+		return nil, nil
 	case 0x03:
 		respBytes, err := readFramedPacket(conn)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		var hs ServerHandshakeResp
 		if json.Unmarshal(respBytes, &hs) == nil {
-			dash.Logf("Assigned Ports -> TCP %s:%d | UDP %d-%d", hs.PublicIP, hs.TCPPort, hs.UDPStart, hs.UDPEnd)
+			extraNote := ""
+			if len(hs.ExtraTunnels) > 0 {
+				extraNote = fmt.Sprintf(" (+%d extra)", len(hs.ExtraTunnels))
+			}
+			dash.Logf("[%s] Assigned TCP %s:%d | UDP %d-%d%s", hs.RegionCode, hs.PublicIP, hs.TCPPort, hs.UDPStart, hs.UDPEnd, extraNote)
 			emitJSONEvent("handshake", map[string]any{
 				"status":        "online",
 				"version":       version,
@@ -1178,19 +1789,21 @@ func sendTunnelToken(conn net.Conn, token string) error {
 				"udp_end":       hs.UDPEnd,
 				"server_props":  hs.ServerProps,
 				"geyser_config": hs.GeyserConfig,
+				"extra_tunnels": hs.ExtraTunnels,
 			})
+			return &hs, nil
 		}
-		return nil
+		return nil, nil
 	case 0x02:
-		return errTunnelAlreadyActive
+		return nil, errTunnelAlreadyActive
 	case 0x04:
-		return errInvalidToken
+		return nil, errInvalidToken
 	default:
 		if sentJSON {
 			useLegacyAuth.Store(true)
-			return errors.New("retrying with legacy token format")
+			return nil, errors.New("retrying with legacy token format")
 		}
-		return errInvalidToken
+		return nil, errInvalidToken
 	}
 }
 
@@ -1220,6 +1833,86 @@ func readFramedPacket(r io.Reader) ([]byte, error) {
 	return payload, nil
 }
 
+func runMultiRegionClients(targets []TokenTarget, localSignaling, localUDPIP string, localUDPDefault int) {
+	var wg sync.WaitGroup
+	for _, t := range targets {
+		wg.Add(1)
+		go func(tgt TokenTarget) {
+			defer wg.Done()
+			runRegionWorker(tgt, localSignaling, localUDPIP, localUDPDefault)
+		}(t)
+	}
+	wg.Wait()
+}
+
+func runRegionWorker(tgt TokenTarget, localSignaling, localUDPIP string, localUDPDefault int) {
+	for {
+		dash.UpdateRegionState(tgt.Code, tgt.Label, tgt.ControlAddr, "CONNECTING", false)
+		conn, err := net.DialTimeout("tcp", tgt.ControlAddr, 10*time.Second)
+		if err != nil {
+			dash.UpdateRegionState(tgt.Code, tgt.Label, tgt.ControlAddr, "OFFLINE", false)
+			dash.Logf("[%s] Dial failed (%s). Retrying in 5s...", tgt.Code, tgt.ControlAddr)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		tuneTCPConn(conn)
+
+		hs, err := sendTunnelToken(conn, tgt.Token)
+		if err != nil {
+			conn.Close()
+			dash.UpdateRegionState(tgt.Code, tgt.Label, tgt.ControlAddr, "OFFLINE", false)
+			if errors.Is(err, errInvalidToken) {
+				dash.Logf("[%s] Token not registered on %s (retrying in 30s)", tgt.Code, tgt.Label)
+				time.Sleep(30 * time.Second)
+			} else {
+				dash.Logf("[%s] Handshake error: %v (retrying in 5s)", tgt.Code, err)
+				time.Sleep(5 * time.Second)
+			}
+			continue
+		}
+
+		if hs != nil {
+			dash.UpdateHandshakeTunnels(tgt.Code, *hs)
+		}
+
+		sess, err := yamux.Client(conn, newYamuxConfig())
+		if err != nil {
+			conn.Close()
+			dash.UpdateRegionState(tgt.Code, tgt.Label, tgt.ControlAddr, "OFFLINE", false)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		stopRawUDP := make(chan struct{})
+		go func() {
+			select {
+			case <-stopRawUDP:
+				return
+			case <-time.After(1500 * time.Millisecond):
+				if !sess.IsClosed() {
+					dash.UpdateRegionState(tgt.Code, tgt.Label, tgt.ControlAddr, "ONLINE", false)
+					dash.Logf("[%s] Tunnel ONLINE via %s!", tgt.Code, tgt.Label)
+					runRawUDPFastLane(stopRawUDP, tgt.Code, tgt.ControlAddr, tgt.Token, localUDPIP, localUDPDefault)
+				}
+			}
+		}()
+
+		for {
+			stream, err := sess.Accept()
+			if err != nil {
+				dash.UpdateRegionState(tgt.Code, tgt.Label, tgt.ControlAddr, "OFFLINE", false)
+				dash.Logf("[%s] Disconnected. Reconnecting...", tgt.Code)
+				break
+			}
+			go handleIncomingStream(stream, localSignaling, localUDPIP, localUDPDefault)
+		}
+
+		close(stopRawUDP)
+		_ = sess.Close()
+		time.Sleep(2 * time.Second)
+	}
+}
+
 func runClient(customControl, customWeb, flagToken, localSignaling, localUDPIP string, localUDPDefault int) {
 	targetControl, token := obtainOrClaimToken(customControl, customWeb, flagToken)
 	handshakeFailures := 0
@@ -1227,6 +1920,7 @@ func runClient(customControl, customWeb, flagToken, localSignaling, localUDPIP s
 	for {
 		var authConn net.Conn
 		var activeControl string
+		var activeHS *ServerHandshakeResp
 
 		if targetControl != "" {
 			hubInfo := resolveNodeInput(targetControl)
@@ -1244,7 +1938,8 @@ func runClient(customControl, customWeb, flagToken, localSignaling, localUDPIP s
 			}
 			tuneTCPConn(conn)
 
-			if err := sendTunnelToken(conn, token); err != nil {
+			hs, err := sendTunnelToken(conn, token)
+			if err != nil {
 				conn.Close()
 				if errors.Is(err, errTunnelAlreadyActive) {
 					dash.SetAlreadyActive(hubInfo.Name, targetControl, "You already have your Bedrock Node running on another machine")
@@ -1276,6 +1971,7 @@ func runClient(customControl, customWeb, flagToken, localSignaling, localUDPIP s
 			} else {
 				authConn = conn
 				activeControl = targetControl
+				activeHS = hs
 				handshakeFailures = 0
 			}
 		}
@@ -1298,11 +1994,12 @@ func runClient(customControl, customWeb, flagToken, localSignaling, localUDPIP s
 				tuneTCPConn(conn)
 				reachable++
 
-				err = sendTunnelToken(conn, token)
+				hs, err := sendTunnelToken(conn, token)
 				if err == nil {
 					authConn = conn
 					activeControl = n.ControlAddr
 					targetControl = n.ControlAddr
+					activeHS = hs
 					_ = saveNodeAddr(targetControl)
 					handshakeFailures = 0
 					break
@@ -1344,6 +2041,11 @@ func runClient(customControl, customWeb, flagToken, localSignaling, localUDPIP s
 			}
 		}
 
+		hubInfo := resolveNodeInput(activeControl)
+		if activeHS != nil {
+			dash.UpdateHandshakeTunnels(hubInfo.Code, *activeHS)
+		}
+
 		sess, err := yamux.Client(authConn, newYamuxConfig())
 		if err != nil {
 			dash.SetState("OFFLINE", "", activeControl, false)
@@ -1353,7 +2055,6 @@ func runClient(customControl, customWeb, flagToken, localSignaling, localUDPIP s
 			continue
 		}
 
-		hubInfo := resolveNodeInput(activeControl)
 		connectedStart := time.Now()
 		stopRawUDP := make(chan struct{})
 		var rawUDPStarted atomic.Bool
@@ -1367,7 +2068,7 @@ func runClient(customControl, customWeb, flagToken, localSignaling, localUDPIP s
 					rawUDPStarted.Store(true)
 					dash.SetState("ONLINE", hubInfo.Name, activeControl, false)
 					dash.Logf("Tunnel ONLINE via %s!", hubInfo.Name)
-					runRawUDPFastLane(stopRawUDP, activeControl, token, localUDPIP, localUDPDefault)
+					runRawUDPFastLane(stopRawUDP, hubInfo.Code, activeControl, token, localUDPIP, localUDPDefault)
 				}
 			}
 		}()
@@ -1396,7 +2097,7 @@ func runClient(customControl, customWeb, flagToken, localSignaling, localUDPIP s
 	}
 }
 
-func runRawUDPFastLane(stopCh <-chan struct{}, controlAddr, token, localUDPIP string, localUDPDefault int) {
+func runRawUDPFastLane(stopCh <-chan struct{}, regionCode, controlAddr, token, localUDPIP string, localUDPDefault int) {
 	rAddr, err := net.ResolveUDPAddr("udp4", controlAddr)
 	if err != nil {
 		return
@@ -1416,11 +2117,16 @@ func runRawUDPFastLane(stopCh <-chan struct{}, controlAddr, token, localUDPIP st
 	defer func() {
 		_ = rawConn.Close()
 		sessionsMu.Lock()
+		nRemoved := int32(len(sessions))
 		for k, s := range sessions {
 			s.Close()
 			delete(sessions, k)
 		}
-		dash.ActiveUDP.Store(0)
+		if nRemoved > 0 {
+			if dash.ActiveUDP.Add(-nRemoved) < 0 {
+				dash.ActiveUDP.Store(0)
+			}
+		}
 		sessionsMu.Unlock()
 	}()
 
@@ -1455,13 +2161,19 @@ func runRawUDPFastLane(stopCh <-chan struct{}, controlAddr, token, localUDPIP st
 			case <-ticker.C:
 				now := time.Now().UnixNano()
 				sessionsMu.Lock()
+				var expired int32
 				for k, s := range sessions {
 					if now-s.lastActive.Load() > int64(2*time.Minute) {
 						s.Close()
 						delete(sessions, k)
+						expired++
 					}
 				}
-				dash.ActiveUDP.Store(int32(len(sessions)))
+				if expired > 0 {
+					if dash.ActiveUDP.Add(-expired) < 0 {
+						dash.ActiveUDP.Store(0)
+					}
+				}
 				sessionsMu.Unlock()
 			}
 		}
@@ -1486,8 +2198,8 @@ func runRawUDPFastLane(stopCh <-chan struct{}, controlAddr, token, localUDPIP st
 		switch buf[0] {
 		case RawUDPMagicHeartbeat:
 			if n >= 2 && buf[1] == 0x01 && !activeFlag.Swap(true) {
-				dash.SetFastLane(true)
-				dash.Logf("RAW UDP FAST-LANE ACTIVE on %s", controlAddr)
+				dash.SetRegionFastLane(regionCode, true)
+				dash.Logf("[%s] RAW UDP FAST-LANE ACTIVE on %s", regionCode, controlAddr)
 			}
 
 		case RawUDPMagicData:
@@ -1520,7 +2232,7 @@ func runRawUDPFastLane(stopCh <-chan struct{}, controlAddr, token, localUDPIP st
 				sess.winnerIdx.Store(-1)
 				sess.lastActive.Store(nowNano)
 				sessions[key] = sess
-				dash.ActiveUDP.Store(int32(len(sessions)))
+				dash.ActiveUDP.Add(1)
 
 				for idx, cc := range conns {
 					go func(i int, c candConn, s *rawLocalSession, k rawPlayerKey) {
@@ -1543,7 +2255,7 @@ func runRawUDPFastLane(stopCh <-chan struct{}, controlAddr, token, localUDPIP st
 							}
 							s.lastActive.Store(time.Now().UnixNano())
 							if s.winnerIdx.Swap(int32(i)) == -1 {
-								dash.Logf("WebRTC UDP connected to Bedrock at %s", c.label)
+								dash.Logf("[%s] WebRTC UDP connected to Bedrock at %s", regionCode, c.label)
 							}
 							dash.BytesOut.Add(uint64(rn))
 							copy(outFrame[9:9+rn], replyBuf[:rn])
